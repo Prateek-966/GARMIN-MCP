@@ -1,0 +1,4 @@
+mcp>=2.1.1,<3
+garminconnect>=0.3.11
+uvicorn[standard]>=0.30
+anyio>=4.4
