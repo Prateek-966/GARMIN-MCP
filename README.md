@@ -3,10 +3,37 @@
 A Streamable HTTP MCP server exposing Garmin Connect data, deployable to Render and
 addable to Claude as a custom connector — including on mobile.
 
-16 tools: activities, activity detail, daily summary, sleep, HRV, training readiness,
-training status, Body Battery, stress, resting HR, VO2 max, race predictions, body
-composition, step ranges, plus a `raw_get` escape hatch for any other read-only
-`get_*` method on `python-garminconnect`.
+26 tools, all read-only.
+
+**Daily metrics** — daily summary, sleep, HRV, stress, resting HR, Body Battery,
+step ranges, and `wellness_detail` (floors, respiration, hydration, heart-rate
+range, body stats).
+
+**Training** — training readiness, training status, VO2 max, race predictions,
+body composition, `fitness_metrics` (endurance score, hill score, lactate
+threshold, cycling FTP, fitness age), personal records, saved workouts, and
+progress totals between two dates.
+
+**Activities** — recent activities, activities by date range, full activity
+detail, and `activity_breakdown` (splits, time in HR zones, weather, strength
+exercise sets, gear used).
+
+**Account** — profile and unit system, devices and battery status, gear mileage.
+
+**Everything else** — `list_raw_methods` enumerates all 105 read-only endpoints
+the underlying library exposes, and `raw_get` calls any of them by name.
+
+### Why not one tool per endpoint
+
+The library exposes ~105 read-only endpoints. Registering each as its own tool
+would put ~105 schemas in the context of every conversation and force Claude to
+choose between near-identical options on every call. So related metrics are
+grouped into composite tools that fetch them in one round of calls —
+`activity_breakdown` covers six endpoints, `wellness_detail` five,
+`fitness_metrics` five — and the long tail stays reachable through
+`list_raw_methods` + `raw_get`. Composite tools tolerate partial failure: Garmin
+404s metrics a day or activity genuinely lacks (a treadmill run has no weather),
+so missing sections are noted and the rest still returns.
 
 ## Why it's built this way
 
@@ -111,5 +138,25 @@ it; regenerate the blob with a matching `auth_setup.py` if it does.
 
 Refresh tokens last roughly a year. Renewal is manual: re-run `auth_setup.py`,
 replace `GARMIN_TOKENS` in Render, redeploy.
+
+Only read operations are exposed. `python-garminconnect` can also write —
+create and delete workouts, log weight and hydration, rename activities, manage
+gear — but this endpoint is a public URL carrying its own bearer key, so a leaked
+connector link would mean write access to your Garmin account rather than a data
+read. If you want write tools, they should be gated behind a separate opt-in
+environment flag; ask and it can be added.
+
+## Credits
+
+The endpoint coverage here was mapped from
+[Taxuspt/garmin_mcp](https://github.com/Taxuspt/garmin_mcp) (MIT, © 2025
+Alexandre Domingues), a local stdio Garmin MCP server with 144 hand-written
+tools. This project is an independent implementation — remote Streamable HTTP
+rather than stdio, key-gated, payload-pruned, and grouped into composite tools —
+but that repo's module layout is what identified which Garmin endpoints are worth
+surfacing. Its tool set targets `garminconnect` 0.3.2 and `mcp` 1.x; this server
+runs 0.3.11 and `mcp` 2.x, where four of the methods it calls no longer exist.
+
+Built on [python-garminconnect](https://github.com/cyberjunky/python-garminconnect).
 
 Nothing here is affiliated with or endorsed by Garmin Ltd.

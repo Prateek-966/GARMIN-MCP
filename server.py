@@ -27,7 +27,12 @@ from typing import Any
 from urllib.parse import parse_qs
 
 import anyio
-from garminconnect import Garmin
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectNotFoundError,
+    GarminConnectTooManyRequestsError,
+)
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -97,11 +102,30 @@ def _get_client(force_new: bool = False) -> Garmin:
         return _client
 
 
+def _is_auth_error(exc: BaseException) -> bool:
+    """Is this worth burning a re-login on?
+
+    Only an expired or rejected session is. A 404 means the metric doesn't
+    exist for that date, and a 429 means Garmin is already rate-limiting us —
+    re-authenticating in either case wastes a login round-trip, and in the 429
+    case actively makes things worse. Composite tools issue several calls each,
+    so retrying indiscriminately would multiply both.
+    """
+    if isinstance(exc, (GarminConnectNotFoundError, GarminConnectTooManyRequestsError)):
+        return False
+    if isinstance(exc, GarminConnectAuthenticationError):
+        return True
+    text = str(exc).lower()
+    return "401" in text or "unauthorized" in text or "authentic" in text
+
+
 def _call_sync(method: str, *args: Any, **kwargs: Any) -> Any:
-    """Call a garminconnect method, retrying once with a fresh session."""
+    """Call a garminconnect method, re-authenticating once if the session died."""
     try:
         return getattr(_get_client(), method)(*args, **kwargs)
-    except Exception as first:  # noqa: BLE001 - garth raises a wide range
+    except Exception as first:  # noqa: BLE001 - the client raises a wide range
+        if not _is_auth_error(first):
+            raise
         log.warning("%s failed (%s); retrying with fresh session", method, first)
         try:
             return getattr(_get_client(force_new=True), method)(*args, **kwargs)
@@ -115,6 +139,27 @@ def _call_sync(method: str, *args: Any, **kwargs: Any) -> Any:
 async def call(method: str, *args: Any, **kwargs: Any) -> Any:
     """Run the blocking Garmin call off the event loop."""
     return await anyio.to_thread.run_sync(lambda: _call_sync(method, *args, **kwargs))
+
+
+async def gather(sections: dict[str, tuple[str, tuple[Any, ...]]]) -> dict[str, Any]:
+    """Run several Garmin calls, keeping whatever succeeds.
+
+    Garmin returns 404 for metrics an activity or day legitimately has no data
+    for — a treadmill run has no weather, a bike ride has no exercise sets, a
+    watch that doesn't measure it has no respiration. One missing section
+    should not fail the whole tool, so each is reported independently and empty
+    ones are dropped rather than filling the response with nulls.
+    """
+    out: dict[str, Any] = {}
+    for label, (method, args) in sections.items():
+        try:
+            result = prune(await call(method, *args))
+        except Exception as exc:  # noqa: BLE001
+            out[label] = f"unavailable: {exc}"
+            continue
+        if result not in (None, {}, [], ""):
+            out[label] = result
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +326,140 @@ async def body_composition(start: str = "", end: str = "") -> str:
 async def steps_range(start: str = "", end: str = "") -> str:
     data = await call("get_daily_steps", start or days_ago(14), end or today())
     return as_text(prune(data))
+
+
+# --- Tools below cover endpoints surfaced by Taxuspt/garmin_mcp (MIT), grouped
+# --- so that related metrics cost one round trip and one tool schema.
+
+
+@mcp.tool(description="Deep detail for one activity: splits, time in heart-rate zones, weather at the time, and strength-training exercise sets. Sections an activity has no data for are omitted.")
+async def activity_breakdown(activity_id: int) -> str:
+    aid = str(activity_id)
+    data = await gather({
+        "splits": ("get_activity_splits", (aid,)),
+        "typed_splits": ("get_activity_typed_splits", (aid,)),
+        "hr_zones": ("get_activity_hr_in_timezones", (aid,)),
+        "weather": ("get_activity_weather", (aid,)),
+        "exercise_sets": ("get_activity_exercise_sets", (aid,)),
+        "gear": ("get_activity_gear", (aid,)),
+    })
+    return as_text(data)
+
+
+@mcp.tool(description="Wellness detail for a date beyond the daily summary: floors climbed, respiration, hydration, heart-rate range, and body stats.")
+async def wellness_detail(day: str = "") -> str:
+    d = day or today()
+    data = await gather({
+        "floors": ("get_floors", (d,)),
+        "respiration": ("get_respiration_data", (d,)),
+        "hydration": ("get_hydration_data", (d,)),
+        "heart_rates": ("get_heart_rates", (d,)),
+        "stats_and_body": ("get_stats_and_body", (d,)),
+    })
+    # These carry minute-by-minute arrays that swamp the summary figures.
+    for section, noisy in (
+        ("respiration", "respirationValuesArray"),
+        ("heart_rates", "heartRateValues"),
+    ):
+        if isinstance(data.get(section), dict):
+            data[section].pop(noisy, None)
+    return as_text(data)
+
+
+@mcp.tool(description="Physiological fitness metrics over a date range: endurance score, hill score, lactate threshold, cycling FTP, and fitness age.")
+async def fitness_metrics(start: str = "", end: str = "") -> str:
+    s, e = start or days_ago(30), end or today()
+    data = await gather({
+        "endurance_score": ("get_endurance_score", (s, e)),
+        "hill_score": ("get_hill_score", (s, e)),
+        "cycling_ftp": ("get_cycling_ftp", ()),
+        "fitness_age": ("get_fitnessage_data", (e,)),
+    })
+    try:
+        lactate = prune(await call("get_lactate_threshold"))
+        if lactate:
+            data["lactate_threshold"] = lactate
+    except Exception as exc:  # noqa: BLE001 - keyword-only args, handled separately
+        data["lactate_threshold"] = f"unavailable: {exc}"
+    return as_text(data)
+
+
+@mcp.tool(description="Personal records across all activity types: fastest 1K/5K/10K, longest run, biggest climb, and so on.")
+async def personal_records() -> str:
+    data = await call("get_personal_record")
+    return as_text(prune(data))
+
+
+@mcp.tool(description="The user's Garmin devices, including which was used most recently and its battery status.")
+async def devices() -> str:
+    data = await gather({
+        "devices": ("get_devices", ()),
+        "last_used": ("get_device_last_used", ()),
+    })
+    return as_text(data)
+
+
+@mcp.tool(description="Registered gear (shoes, bikes) with mileage and usage stats. Optionally pass a gear UUID for that item's detailed stats.")
+async def gear(gear_uuid: str = "") -> str:
+    if gear_uuid:
+        return as_text(prune(await call("get_gear_stats", gear_uuid)))
+    # get_gear needs the profile number, which the caller has no way to know.
+    profile = await call("get_user_profile")
+    profile_id = ""
+    if isinstance(profile, dict):
+        profile_id = str(
+            profile.get("userProfileNumber")
+            or profile.get("profileId")
+            or profile.get("id")
+            or ""
+        )
+    if not profile_id:
+        return "Could not determine the Garmin profile number needed to list gear."
+    return as_text(prune(await call("get_gear", profile_id)))
+
+
+@mcp.tool(description="The user's Garmin profile: name, unit system (metric or statute), and profile settings. Useful for interpreting units in other tools.")
+async def user_profile() -> str:
+    data = await gather({
+        "full_name": ("get_full_name", ()),
+        "unit_system": ("get_unit_system", ()),
+        "profile": ("get_user_profile", ()),
+    })
+    return as_text(data)
+
+
+@mcp.tool(description="Saved workouts on the user's Garmin account, newest first.")
+async def workouts(limit: int = 20) -> str:
+    data = await call("get_workouts", 0, limit)
+    return as_text(prune(data))
+
+
+@mcp.tool(description="Totals rolled up between two dates. metric is one of: distance, duration, elevationGain, calories.")
+async def progress_summary(start: str = "", end: str = "", metric: str = "distance") -> str:
+    data = await call(
+        "get_progress_summary_between_dates", start or days_ago(30), end or today(), metric
+    )
+    return as_text(prune(data))
+
+
+@mcp.tool(description="List every read-only get_* method available through raw_get, with its parameters. Call this first when no dedicated tool covers what you need.")
+async def list_raw_methods() -> str:
+    import inspect
+
+    lines = []
+    for name in sorted(dir(Garmin)):
+        if not name.startswith("get_"):
+            continue
+        try:
+            sig = str(inspect.signature(getattr(Garmin, name))).replace("self, ", "").replace("self", "")
+        except (TypeError, ValueError):
+            sig = "(...)"
+        lines.append(f"{name}{sig}")
+    return (
+        f"{len(lines)} read-only methods callable via raw_get. Return annotations "
+        "are shown for reference; pass arguments positionally as strings.\n\n"
+        + "\n".join(lines)
+    )
 
 
 @mcp.tool(description="Escape hatch: call any read-only get_* method on the python-garminconnect client by name, with positional args. Use when no dedicated tool fits.")

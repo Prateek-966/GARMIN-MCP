@@ -26,6 +26,10 @@ os.environ["MCP_KEY"] = KEY
 os.environ.pop("RENDER_EXTERNAL_HOSTNAME", None)
 
 import httpx  # noqa: E402
+from garminconnect import (  # noqa: E402
+    GarminConnectAuthenticationError,
+    GarminConnectNotFoundError,
+)
 import uvicorn  # noqa: E402
 
 import server  # noqa: E402
@@ -36,15 +40,30 @@ class FakeGarmin:
 
     calls: list[tuple[str, tuple[Any, ...]]] = []
 
+    # Methods that raise, to model Garmin 404ing a metric the day or activity
+    # genuinely has no data for.
+    missing: set[str] = {"get_activity_weather", "get_hydration_data"}
+
     def __getattr__(self, name: str):
         def method(*args: Any, **kwargs: Any) -> Any:
             FakeGarmin.calls.append((name, args))
+            if name in FakeGarmin.missing:
+                raise GarminConnectNotFoundError(f"404 for {name}")
             if name == "get_activities":
                 return [{
                     "activityId": 1, "activityName": "Morning Run",
                     "distance": 5000.0, "averageHR": 148, "dropMe": None,
                     "notInAllowlist": "should be filtered",
                 }]
+            if name == "get_user_profile":
+                return {"userProfileNumber": 998877, "displayName": "runner"}
+            if name == "get_full_name":
+                return "Test Runner"
+            if name == "get_respiration_data":
+                return {"avgSleepRespirationValue": 14.2,
+                        "respirationValuesArray": [[1, 2]] * 400}
+            if name == "get_heart_rates":
+                return {"restingHeartRate": 48, "heartRateValues": [[1, 60]] * 400}
             return {"date": args[0] if args else None, "value": 42, "empty": None}
 
         return method
@@ -120,8 +139,11 @@ def main() -> int:
             "sleep", "hrv", "training_readiness", "training_status", "body_battery",
             "stress", "resting_heart_rate", "vo2_max", "race_predictions",
             "body_composition", "steps_range", "raw_get",
+            "activity_breakdown", "wellness_detail", "fitness_metrics",
+            "personal_records", "devices", "gear", "user_profile", "workouts",
+            "progress_summary", "list_raw_methods",
         }
-        check("all 16 tools are registered", names == expected, f"missing {sorted(expected - names)} extra {sorted(names - expected)}")
+        check("all 26 tools are registered", names == expected, f"missing {sorted(expected - names)} extra {sorted(names - expected)}")
         check("every tool has a description",
               all(t.get("description") for t in listed.get("result", {}).get("tools", [])))
 
@@ -147,6 +169,78 @@ def main() -> int:
         res = rpc(client, "tools/call", {"name": "raw_get", "arguments": {"method": "get_device_last_used"}})
         check("raw_get allows get_* methods",
               any(n == "get_device_last_used" for n, _ in FakeGarmin.calls))
+
+        # --- composite tools -------------------------------------------------
+        res = rpc(client, "tools/call", {"name": "activity_breakdown", "arguments": {"activity_id": 42}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        check("activity_breakdown returns the sections that exist",
+              "splits" in payload and "hr_zones" in payload, str(payload)[:200])
+        check("activity_breakdown reports a 404 section without failing the call",
+              "unavailable" in str(payload.get("weather", "")), str(payload)[:200])
+        check("activity_breakdown passes the id as a string",
+              ("get_activity_splits", ("42",)) in FakeGarmin.calls)
+
+        before = len([c for c in FakeGarmin.calls if c[0] == "get_activity_weather"])
+        check("a 404 does not trigger a re-auth retry", before == 1, f"called {before}x")
+
+        res = rpc(client, "tools/call", {"name": "wellness_detail", "arguments": {}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        check("wellness_detail keeps summary figures",
+              payload.get("heart_rates", {}).get("restingHeartRate") == 48, str(payload)[:200])
+        check("wellness_detail drops minute-by-minute arrays",
+              "heartRateValues" not in str(payload) and "respirationValuesArray" not in str(payload))
+
+        res = rpc(client, "tools/call", {"name": "gear", "arguments": {}})
+        check("gear looks up the profile number the API needs",
+              ("get_gear", ("998877",)) in FakeGarmin.calls, str(FakeGarmin.calls)[-300:])
+
+        res = rpc(client, "tools/call", {"name": "gear", "arguments": {"gear_uuid": "abc"}})
+        check("gear with a uuid fetches that item's stats",
+              ("get_gear_stats", ("abc",)) in FakeGarmin.calls)
+
+        res = rpc(client, "tools/call", {"name": "user_profile", "arguments": {}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        check("user_profile combines name, units and profile",
+              payload.get("full_name") == "Test Runner" and "profile" in payload, str(payload)[:200])
+
+        res = rpc(client, "tools/call", {"name": "list_raw_methods", "arguments": {}})
+        text = res["result"]["content"][0]["text"]
+        check("list_raw_methods enumerates real client methods",
+              "get_floors" in text and "get_menstrual_calendar_data" in text, text[:150])
+        check("list_raw_methods excludes non-get_ methods",
+              "add_weigh_in" not in text and "delete_workout" not in text)
+
+        # An expired session, unlike a 404, is worth exactly one re-login.
+        attempts = {"n": 0}
+
+        def flaky(*_a: Any, **_k: Any) -> Any:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise GarminConnectAuthenticationError("401 Unauthorized")
+            return {"recovered": True}
+
+        rebuilds = {"n": 0}
+
+        def counting_build() -> Any:
+            rebuilds["n"] += 1
+            fake = FakeGarmin()
+            object.__setattr__(fake, "get_rhr_day", flaky)
+            return fake
+
+        server._build_client = counting_build
+        server._client = None
+        res = rpc(client, "tools/call", {"name": "resting_heart_rate", "arguments": {}})
+        text = res["result"]["content"][0]["text"]
+        check("an expired session triggers one re-auth and recovers",
+              "recovered" in text and attempts["n"] == 2, f"{text[:80]} attempts={attempts['n']}")
+        check("re-auth builds exactly one fresh client", rebuilds["n"] == 2, str(rebuilds))
+        server._build_client = lambda: FakeGarmin()
+        server._client = None
+
+        res = rpc(client, "tools/call", {"name": "fitness_metrics", "arguments": {}})
+        payload = json.loads(res["result"]["content"][0]["text"])
+        check("fitness_metrics gathers the physiological set",
+              {"endurance_score", "hill_score", "cycling_ftp"} <= set(payload), str(payload)[:200])
 
     uv.should_exit = True
     print()
